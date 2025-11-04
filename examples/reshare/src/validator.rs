@@ -537,6 +537,23 @@ mod test {
         }
     }
 
+    #[test_traced("INFO")]
+    fn test_001() {
+        if let Err(e) = (Plan {
+            seed: 0,
+            total: 4,
+            link: Link {
+                latency: Duration::from_millis(0),
+                jitter: Duration::from_millis(0),
+                success_rate: 1.0,
+            },
+        }
+        .run::<ThresholdScheme<MinSig>>())
+        {
+            panic!("failure: {e}");
+        }
+    }
+
     /// Links (or unlinks) validators using the oracle.
     ///
     /// The `action` parameter determines the action (e.g. link, unlink) to take.
