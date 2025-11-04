@@ -5,7 +5,7 @@ cfg_if::cfg_if! {
         use alloc::borrow::{Cow, ToOwned};
     }
 }
-use crate::PrivateKeyExt;
+use crate::{PrivateKeyExt, Recoverable};
 use bytes::{Buf, BufMut};
 use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
 use commonware_utils::{hex, union_unique, Array, Span};
@@ -16,7 +16,7 @@ use core::{
 };
 use ecdsa::RecoveryId;
 use p256::{
-    ecdsa::{signature::Verifier, SigningKey, VerifyingKey},
+    ecdsa::{SigningKey, VerifyingKey},
     elliptic_curve::scalar::IsHigh,
 };
 use rand_core::CryptoRngCore;
@@ -187,11 +187,10 @@ impl crate::Verifier for PublicKey {
     type Signature = Signature;
 
     fn verify(&self, namespace: Option<&[u8]>, msg: &[u8], sig: &Self::Signature) -> bool {
-        let payload = match namespace {
-            Some(namespace) => Cow::Owned(union_unique(namespace, msg)),
-            None => Cow::Borrowed(msg),
+        let Some(recovered_signer) = sig.recover_signer(namespace, msg) else {
+            return false;
         };
-        self.key.verify(&payload, &sig.signature).is_ok()
+        &recovered_signer == self
     }
 }
 
@@ -278,18 +277,6 @@ impl Signature {
             recovery_id,
             signature,
         }
-    }
-
-    /// Returns the canonical 64-byte `(r || s)` encoding.
-    pub fn signature_bytes(&self) -> [u8; BASE_SIGNATURE_LENGTH] {
-        let mut bytes = [0u8; BASE_SIGNATURE_LENGTH];
-        bytes.copy_from_slice(self.signature.to_bytes().as_slice());
-        bytes
-    }
-
-    /// Returns the recovery identifier associated with this signature.
-    pub fn recovery_id(&self) -> RecoveryId {
-        self.recovery_id
     }
 }
 
@@ -397,7 +384,7 @@ impl Display for Signature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Recoverable as _, Signer as _, Verifier as _};
+    use crate::{Signer as _, Verifier as _};
     use bytes::Bytes;
     use commonware_codec::{DecodeExt, Encode};
     use ecdsa::RecoveryId;
@@ -522,8 +509,8 @@ mod tests {
             "flipped y-parity must fail recovery"
         );
 
-        // The signature should still verify correctly.
-        assert!(private_key.public_key().verify(None, message, &signature));
+        // The signature verification should fail, since recovered != expected.
+        assert!(!private_key.public_key().verify(None, message, &signature));
     }
 
     #[test]
@@ -672,7 +659,7 @@ mod tests {
         );
         let signature = private_key.sign(None, message);
         assert_eq!(
-            signature.signature_bytes().to_vec(),
+            signature.signature.to_bytes().to_vec(),
             exp_sig.normalize_s().unwrap().to_bytes().to_vec()
         );
 
@@ -690,7 +677,7 @@ mod tests {
 
         let signature = private_key.sign(None, message);
         assert_eq!(
-            signature.signature_bytes().to_vec(),
+            signature.signature.to_bytes().to_vec(),
             exp_sig.to_bytes().to_vec()
         );
     }
