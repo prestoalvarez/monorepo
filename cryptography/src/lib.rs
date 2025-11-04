@@ -100,6 +100,20 @@ pub trait PublicKey: Verifier + Sized + ReadExt + Encode + PartialEq + Array {}
 /// A [Signature] over a message.
 pub trait Signature: Sized + Clone + ReadExt + Encode + PartialEq + Array {}
 
+/// An extension of [Signature] that supports public key recovery.
+pub trait Recoverable: Signature {
+    /// The type of [PublicKey] that can be recovered from this [Signature].
+    type PublicKey: PublicKey<Signature = Self>;
+
+    /// Recover the [PublicKey] of the signer that created this [Signature] over the given message.
+    ///
+    /// The message should not be hashed prior to calling this function. If a particular
+    /// scheme requires a payload to be hashed before it is signed, it will be done internally.
+    ///
+    /// Like when verifying a signature, the namespace must match what was used during signing exactly.
+    fn recover_signer(&self, namespace: Option<&[u8]>, msg: &[u8]) -> Option<Self::PublicKey>;
+}
+
 /// Verifies whether all [Signature]s are correct or that some [Signature] is incorrect.
 pub trait BatchVerifier<K: PublicKey> {
     /// Create a new batch verifier.
@@ -436,7 +450,7 @@ mod tests {
     #[test]
     fn test_secp256r1_len() {
         assert_eq!(secp256r1::PublicKey::SIZE, 33);
-        assert_eq!(secp256r1::Signature::SIZE, 64);
+        assert_eq!(secp256r1::Signature::SIZE, 65);
     }
 
     fn test_hasher_multiple_runs<H: Hasher>() {

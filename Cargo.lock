@@ -1195,6 +1195,7 @@ dependencies = [
  "commonware-codec",
  "commonware-utils",
  "criterion",
+ "ecdsa",
  "ed25519-consensus",
  "getrandom 0.2.15",
  "p256",

@@ -14,11 +14,9 @@ use core::{
     hash::{Hash, Hasher},
     ops::Deref,
 };
+use ecdsa::RecoveryId;
 use p256::{
-    ecdsa::{
-        signature::{Signer, Verifier},
-        SigningKey, VerifyingKey,
-    },
+    ecdsa::{signature::Verifier, SigningKey, VerifyingKey},
     elliptic_curve::scalar::IsHigh,
 };
 use rand_core::CryptoRngCore;
@@ -27,7 +25,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 const CURVE_NAME: &str = "secp256r1";
 const PRIVATE_KEY_LENGTH: usize = 32;
 const PUBLIC_KEY_LENGTH: usize = 33; // Y-Parity || X
-const SIGNATURE_LENGTH: usize = 64; // R || S
+const BASE_SIGNATURE_LENGTH: usize = 64; // R || S
+const SIGNATURE_LENGTH: usize = 1 + BASE_SIGNATURE_LENGTH; // RecoveryId || R || S
 
 /// Secp256r1 Private Key.
 #[derive(Clone, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
@@ -47,15 +46,24 @@ impl crate::Signer for PrivateKey {
     type PublicKey = PublicKey;
 
     fn sign(&self, namespace: Option<&[u8]>, msg: &[u8]) -> Self::Signature {
-        let signature: p256::ecdsa::Signature = match namespace {
-            Some(namespace) => self.key.sign(&union_unique(namespace, msg)),
-            None => self.key.sign(msg),
+        let payload = match namespace {
+            Some(namespace) => union_unique(namespace, msg),
+            None => msg.to_vec(),
         };
-        let signature = match signature.normalize_s() {
-            Some(normalized) => normalized,
-            None => signature,
-        };
-        Signature::from(signature)
+        let (mut signature, mut recovery_id) = self
+            .key
+            .sign_recoverable(&payload)
+            .expect("signing must succeed");
+
+        // The signing algorithm generates k, then calculates r <- x(k * G). Normalizing s by negating it is equivalent
+        // to negating k. This has no effect on x(k * G) but y(-k * G) = -y(k * G), hence the need to flip the bit if
+        // we move s into the lower half of the curve order.
+        if let Some(normalized) = signature.normalize_s() {
+            signature = normalized;
+            recovery_id = RecoveryId::new(!recovery_id.is_y_odd(), recovery_id.is_x_reduced());
+        }
+
+        Signature::new(signature, recovery_id)
     }
 
     fn public_key(&self) -> Self::PublicKey {
@@ -255,10 +263,52 @@ impl Display for PublicKey {
 #[derive(Clone, Eq, PartialEq)]
 pub struct Signature {
     raw: [u8; SIGNATURE_LENGTH],
+    recovery_id: RecoveryId,
     signature: p256::ecdsa::Signature,
 }
 
+impl Signature {
+    fn new(signature: p256::ecdsa::Signature, recovery_id: RecoveryId) -> Self {
+        let mut raw = [0u8; SIGNATURE_LENGTH];
+        raw[0] = recovery_id.to_byte();
+        raw[1..].copy_from_slice(signature.to_bytes().as_slice());
+
+        Self {
+            raw,
+            recovery_id,
+            signature,
+        }
+    }
+
+    /// Returns the canonical 64-byte `(r || s)` encoding.
+    pub fn signature_bytes(&self) -> [u8; BASE_SIGNATURE_LENGTH] {
+        let mut bytes = [0u8; BASE_SIGNATURE_LENGTH];
+        bytes.copy_from_slice(self.signature.to_bytes().as_slice());
+        bytes
+    }
+
+    /// Returns the recovery identifier associated with this signature.
+    pub fn recovery_id(&self) -> RecoveryId {
+        self.recovery_id
+    }
+}
+
 impl crate::Signature for Signature {}
+
+impl crate::Recoverable for Signature {
+    type PublicKey = PublicKey;
+
+    fn recover_signer(&self, namespace: Option<&[u8]>, msg: &[u8]) -> Option<Self::PublicKey> {
+        let payload = match namespace {
+            Some(namespace) => Cow::Owned(union_unique(namespace, msg)),
+            None => Cow::Borrowed(msg),
+        };
+
+        VerifyingKey::recover_from_msg(payload.as_ref(), &self.signature, self.recovery_id)
+            .ok()
+            .map(PublicKey::from)
+    }
+}
 
 impl Write for Signature {
     fn write(&self, buf: &mut impl BufMut) {
@@ -271,7 +321,9 @@ impl Read for Signature {
 
     fn read_cfg(buf: &mut impl Buf, _: &()) -> Result<Self, CodecError> {
         let raw = <[u8; Self::SIZE]>::read(buf)?;
-        let result = p256::ecdsa::Signature::from_slice(&raw);
+        let recovery_id = RecoveryId::from_byte(raw[0])
+            .ok_or_else(|| CodecError::Invalid(CURVE_NAME, "RecoveryId out of range"))?;
+        let result = p256::ecdsa::Signature::from_slice(&raw[1..]);
         #[cfg(feature = "std")]
         let signature = result.map_err(|e| CodecError::Wrapped(CURVE_NAME, e.into()))?;
         #[cfg(not(feature = "std"))]
@@ -281,7 +333,11 @@ impl Read for Signature {
             // Reject any signatures with a `s` value in the upper half of the curve order.
             return Err(CodecError::Invalid(CURVE_NAME, "Signature S is high"));
         }
-        Ok(Self { raw, signature })
+        Ok(Self {
+            raw,
+            signature,
+            recovery_id,
+        })
     }
 }
 
@@ -324,13 +380,6 @@ impl Deref for Signature {
     }
 }
 
-impl From<p256::ecdsa::Signature> for Signature {
-    fn from(signature: p256::ecdsa::Signature) -> Self {
-        let raw = signature.to_bytes().into();
-        Self { raw, signature }
-    }
-}
-
 impl Debug for Signature {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", hex(&self.raw))
@@ -348,9 +397,10 @@ impl Display for Signature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Signer as _, Verifier as _};
+    use crate::{Recoverable as _, Signer as _, Verifier as _};
     use bytes::Bytes;
     use commonware_codec::{DecodeExt, Encode};
+    use ecdsa::RecoveryId;
 
     fn create_private_key() -> PrivateKey {
         const HEX: &str = "519b423d715f8b581f4fa8ee59f4771a5b44c8130b4e3eacca54a56dda72b464";
@@ -380,16 +430,27 @@ mod tests {
         let public_key = parse_public_key_as_compressed(qx, qy);
         let signature = parse_signature(r, s);
         let message = commonware_utils::from_hex_formatted(m).unwrap();
-        (public_key, signature, message)
+        let encoded_signature =
+            encode_signature_with_recovery(&public_key.key, &message, &signature);
+        (public_key, encoded_signature, message)
     }
 
-    fn parse_signature(r: &str, s: &str) -> Vec<u8> {
+    fn parse_signature(r: &str, s: &str) -> p256::ecdsa::Signature {
         let vec_r = commonware_utils::from_hex_formatted(r).unwrap();
         let vec_s = commonware_utils::from_hex_formatted(s).unwrap();
         let f1 = p256::FieldBytes::from_slice(&vec_r);
         let f2 = p256::FieldBytes::from_slice(&vec_s);
-        let s = p256::ecdsa::Signature::from_scalars(*f1, *f2).unwrap();
-        s.to_vec()
+        p256::ecdsa::Signature::from_scalars(*f1, *f2).unwrap()
+    }
+
+    fn encode_signature_with_recovery(
+        verifying_key: &VerifyingKey,
+        message: &[u8],
+        signature: &p256::ecdsa::Signature,
+    ) -> Vec<u8> {
+        let recovery_id = RecoveryId::trial_recovery_from_msg(verifying_key, message, signature)
+            .unwrap_or_else(|_| RecoveryId::new(false, false));
+        Signature::new(*signature, recovery_id).encode().to_vec()
     }
 
     fn parse_public_key_as_compressed(qx: &str, qy: &str) -> PublicKey {
@@ -424,6 +485,73 @@ mod tests {
             return format!("0{value}");
         }
         value.to_string()
+    }
+
+    #[test]
+    fn test_recover_signer_without_namespace() {
+        let private_key = create_private_key();
+        let expected_public_key = private_key.public_key();
+        let message = b"recover with no namespace";
+
+        let signature = private_key.sign(None, message);
+        let recovered = signature.recover_signer(None, message);
+
+        assert_eq!(recovered, Some(expected_public_key));
+    }
+
+    #[test]
+    fn test_recover_signer_flipped_y_parity_fails() {
+        let private_key = create_private_key();
+        let expected_public_key = private_key.public_key();
+        let message = b"recover with no namespace";
+
+        let mut signature = private_key.sign(None, message);
+
+        // Explicitly flip the y-parity bit to test recovery failure.
+        signature.recovery_id = RecoveryId::new(
+            !signature.recovery_id.is_y_odd(),
+            signature.recovery_id.is_x_reduced(),
+        );
+
+        let recovered = signature.recover_signer(None, message);
+
+        // The recovery must fail.
+        assert_ne!(
+            recovered,
+            Some(expected_public_key),
+            "flipped y-parity must fail recovery"
+        );
+
+        // The signature should still verify correctly.
+        assert!(private_key.public_key().verify(None, message, &signature));
+    }
+
+    #[test]
+    fn test_recover_signer_with_namespace() {
+        let private_key = create_private_key();
+        let expected_public_key = private_key.public_key();
+        let namespace = b"msr";
+        let message = b"recover with namespace";
+
+        let signature = private_key.sign(Some(namespace), message);
+        let recovered = signature.recover_signer(Some(namespace), message);
+        assert_eq!(recovered, Some(expected_public_key.clone()));
+    }
+
+    #[test]
+    fn test_recover_signer_mismatched_message_does_not_match_public_key() {
+        let private_key = create_private_key();
+        let namespace = b"msr";
+        let original_message = b"recover with namespace";
+        let expected_public_key = private_key.public_key();
+        let signature = private_key.sign(Some(namespace), original_message);
+
+        let recovered = signature.recover_signer(Some(namespace), b"different message");
+        assert_ne!(
+            recovered,
+            Some(expected_public_key),
+            "mismatched message must not recover the original public key"
+        );
     }
 
     #[test]
@@ -501,7 +629,7 @@ mod tests {
         let message = b"edge";
         let signature = private_key.sign(None, message);
         let mut bad_signature = signature.to_vec();
-        bad_signature[32] |= 0x80; // force S into upper range
+        bad_signature[33] |= 0x80; // force S into upper range (first byte of S)
         assert!(Signature::decode(bad_signature.as_ref()).is_err());
     }
 
@@ -511,11 +639,11 @@ mod tests {
         let message = b"edge";
         let signature = private_key.sign(None, message);
         let mut bad_signature = signature.to_vec();
-        for b in bad_signature.iter_mut().take(32) {
+        for b in bad_signature.iter_mut().skip(1).take(32) {
             *b = 0x00;
         }
         // ensure S component is non-zero
-        bad_signature[32] = 1;
+        bad_signature[33] = 1;
         assert!(Signature::decode(bad_signature.as_ref()).is_err());
     }
 
@@ -543,7 +671,10 @@ mod tests {
             .unwrap(),
         );
         let signature = private_key.sign(None, message);
-        assert_eq!(signature.to_vec(), exp_sig.normalize_s().unwrap().to_vec());
+        assert_eq!(
+            signature.signature_bytes().to_vec(),
+            exp_sig.normalize_s().unwrap().to_bytes().to_vec()
+        );
 
         let (message, exp_sig) = (
             b"test",
@@ -558,7 +689,10 @@ mod tests {
         );
 
         let signature = private_key.sign(None, message);
-        assert_eq!(signature.to_vec(), exp_sig.to_vec());
+        assert_eq!(
+            signature.signature_bytes().to_vec(),
+            exp_sig.to_bytes().to_vec()
+        );
     }
 
     #[test]
@@ -596,9 +730,8 @@ mod tests {
         .unwrap();
         let message = b"sample";
         let signature = private_key.sign(None, message);
-        let (_, s) = signature.split_at(32);
-        let mut signature: Vec<u8> = vec![0x00; 32];
-        signature.extend_from_slice(s);
+        let mut signature = signature.to_vec();
+        signature[1..33].fill(0);
 
         // Try to parse signature
         assert!(Signature::decode(signature.as_ref()).is_err());
@@ -617,10 +750,8 @@ mod tests {
         .unwrap();
         let message = b"sample";
         let signature = private_key.sign(None, message);
-        let (r, _) = signature.split_at(32);
-        let s: Vec<u8> = vec![0x00; 32];
-        let mut signature = r.to_vec();
-        signature.extend(s);
+        let mut signature = signature.to_vec();
+        signature[33..].fill(0);
 
         // Try to parse signature
         assert!(Signature::decode(signature.as_ref()).is_err());
@@ -696,9 +827,9 @@ mod tests {
         ];
 
         for (index, test) in cases.into_iter().enumerate() {
-            let (public_key, sig, message, expected) = test;
-            let expected = if expected {
-                let mut ecdsa_signature = p256::ecdsa::Signature::from_slice(&sig).unwrap();
+            let (public_key, sig, message, expected_valid) = test;
+            let expected = if expected_valid {
+                let mut ecdsa_signature = p256::ecdsa::Signature::from_slice(&sig[1..]).unwrap();
                 if ecdsa_signature.s().is_high().into() {
                     // Valid signatures not normalized must be considered invalid.
                     assert!(Signature::decode(sig.as_ref()).is_err());
@@ -709,19 +840,25 @@ mod tests {
                         ecdsa_signature = normalized_sig;
                     }
                 }
-                let signature = Signature::from(ecdsa_signature);
+                let recovery_id = RecoveryId::trial_recovery_from_msg(
+                    &public_key.key,
+                    &message,
+                    &ecdsa_signature,
+                )
+                .expect("recovery id");
+                let signature = Signature::new(ecdsa_signature, recovery_id);
                 public_key.verify(None, &message, &signature)
             } else {
                 let tf_res = Signature::decode(sig.as_ref());
-                let dc_res = Signature::decode(Bytes::from(sig));
-                if tf_res.is_err() && dc_res.is_err() {
-                    // The parsing should fail
-                    true
-                } else {
-                    // Or the validation should fail
-                    let f1 = !public_key.verify(None, &message, &tf_res.unwrap());
-                    let f2 = !public_key.verify(None, &message, &dc_res.unwrap());
-                    f1 && f2
+                let dc_res = Signature::decode(Bytes::from(sig.clone()));
+                match (tf_res, dc_res) {
+                    (Err(_), Err(_)) => true,
+                    (Ok(sig1), Err(_)) => !public_key.verify(None, &message, &sig1),
+                    (Err(_), Ok(sig2)) => !public_key.verify(None, &message, &sig2),
+                    (Ok(sig1), Ok(sig2)) => {
+                        !public_key.verify(None, &message, &sig1)
+                            && !public_key.verify(None, &message, &sig2)
+                    }
                 }
             };
             assert!(expected, "vector_signature_verification_{}", index + 1);
