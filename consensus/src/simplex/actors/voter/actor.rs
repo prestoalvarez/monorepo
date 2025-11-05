@@ -801,16 +801,6 @@ impl<
                     )
                     .await;
                 }
-
-                // If we have a latest finalization, broadcast it
-                if let Some(finalization) = self
-                    .views
-                    .get(&self.last_finalized)
-                    .and_then(|r| r.finalization.as_ref().cloned())
-                {
-                    self.broadcast_cert(recovered_sender, Voter::Finalization(finalization), true)
-                        .await;
-                }
             }
         }
 
