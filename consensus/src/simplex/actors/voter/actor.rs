@@ -817,8 +817,6 @@ impl<
         if !retry {
             batcher.constructed(Voter::Nullify(nullify.clone())).await;
             self.handle_nullify(nullify.clone()).await;
-
-            // Sync the journal
             self.journal_sync(self.view).await;
         }
 
@@ -1076,6 +1074,7 @@ impl<
         // Persist certification result for recovery
         let msg = Voter::Certification(Rnd::new(self.epoch, view), success);
         self.journal_append(view, msg).await;
+        self.journal_sync(view).await;
 
         // Log the result and exit early if certification failed since we should not move to the
         // next view until a nullification is formed.
@@ -1196,22 +1195,21 @@ impl<
         let kept_views = self.views.split_off(&min);
         let kept_leaders = self.leaders.split_off(&min);
 
-        // Log and prune journal if we pruned any views
-        {
+        // Log and prune journal if we pruned any views. Due to how `split_off` works,
+        // `self.views` itself holds the views that will be pruned.
+        if self.views.len() > 0 {
             let pruned_views = self.views.keys().collect::<Vec<_>>();
             debug!(
                 views = ?pruned_views,
                 last_finalized = self.last_finalized,
                 "pruned views"
             );
-            if !pruned_views.is_empty() {
-                self.journal
-                    .as_mut()
-                    .unwrap()
-                    .prune(min)
-                    .await
-                    .expect("unable to prune journal");
-            }
+            self.journal
+                .as_mut()
+                .unwrap()
+                .prune(min)
+                .await
+                .expect("unable to prune journal");
         }
 
         // Update leaders and views with the kept ones
@@ -1375,6 +1373,10 @@ impl<
         {
             self.journal_append(view, msg).await;
         }
+
+        // Enter this view if we haven't already.
+        // Certification of this view will move us to the next view.
+        self.enter_view(view);
     }
 
     async fn nullification(&mut self, nullification: Nullification<S>) -> Action {
@@ -1581,8 +1583,6 @@ impl<
             // Handle the notarize
             batcher.constructed(Voter::Notarize(notarize.clone())).await;
             self.handle_notarize(notarize.clone()).await;
-
-            // Sync the journal
             self.journal_sync(view).await;
 
             // Broadcast the notarize
@@ -1602,8 +1602,6 @@ impl<
 
             // Handle the notarization
             self.handle_notarization(notarization.clone()).await;
-
-            // Sync the journal
             self.journal_sync(view).await;
 
             // Alert application
@@ -1626,8 +1624,6 @@ impl<
 
             // Handle the nullification
             self.handle_nullification(nullification.clone()).await;
-
-            // Sync the journal
             self.journal_sync(view).await;
 
             // Alert application
@@ -1675,8 +1671,6 @@ impl<
             // Handle the finalize
             batcher.constructed(Voter::Finalize(finalize.clone())).await;
             self.handle_finalize(finalize.clone()).await;
-
-            // Sync the journal
             self.journal_sync(view).await;
 
             // Broadcast the finalize
