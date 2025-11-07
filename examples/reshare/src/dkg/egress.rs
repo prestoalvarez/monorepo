@@ -1,5 +1,5 @@
 use commonware_cryptography::bls12381::{
-    dkg2::Output,
+    dkg::Output,
     primitives::{group::Share, variant::Variant},
 };
 use std::{future::Future, pin::Pin};
